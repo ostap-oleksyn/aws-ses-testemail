@@ -1,1 +1,1 @@
-# aws-ses-testemail
+# aws-ses-testemail cloudformation template
