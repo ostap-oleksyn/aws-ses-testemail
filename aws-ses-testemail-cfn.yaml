@@ -1,0 +1,391 @@
+Description: Ses/S3 test emails receiving stack
+Mappings: 
+  SmtpServer: 
+    us-east-1: 
+      'smtp': inbound-smtp.us-east-1.amazonaws.com
+    us-west-2: 
+      'smtp': inbound-smtp.us-west-2.amazonaws.com
+    eu-west-1: 
+      'smtp': inbound-smtp.eu-west-1.amazonaws.com
+    
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    -
+      Parameters:
+      - Domain
+      - HostedZoneId
+      - BucketName
+      - ExpirationPeriod
+      - UserName
+    ParameterLabels:
+      Domain:
+        default: 'Domain name'
+      HostedZoneId:
+        default: 'Hosted Zone Id'
+      UserName:
+        default: 'Username'
+      BucketName:
+        default: 'Bucket name'
+      ExpirationPeriod:
+        default: 'Expiration period'
+
+Parameters:
+  Domain:
+    Type: String
+    Description: Domain name that will be used by SES.
+  HostedZoneId:
+    Type: String
+    Description: Domain hosted zone id (Optional).
+  UserName:
+    Type: String
+    Default: testSesS3user
+    Description: IAM user that will be created for accessing emails in s3 bucket.
+  BucketName:
+    Type: String
+    Description: Bucket name where emails will be stored.
+  ExpirationPeriod:
+    Type: String
+    Default: 2
+    Description: How many days to store emails in s3.
+
+Conditions:
+  UseRoute53:
+    !Not [!Equals [!Ref HostedZoneId, ""]]  
+
+Resources:
+  EmailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteEverytingOlderThanTwoDays
+            Status: Enabled
+            ExpirationInDays: !Ref ExpirationPeriod
+
+  EmailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Principal:
+              Service: ses.amazonaws.com
+            Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+
+  SesEmailUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: SesEmailUser
+
+  SesEmailUserKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref SesEmailUser
+
+  SesEmailUserPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: S3SesEmailRead
+      Users:
+        - !Ref SesEmailUser
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${BucketName}
+          -
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+
+  SesLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SesLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - edgelambda.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyName: SesLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - ses:SetActiveReceiptRuleSet
+                  - ses:VerifyDomainIdentity
+                  - ses:DeleteIdentity
+                Resource: '*'
+              -
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${BucketName}
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub arn:aws:s3:::${BucketName}/*
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - 
+                Effect: Allow
+                Action:
+                - route53:GetHostedZone
+                - route53:ChangeResourceRecordSets
+                Resource: !Sub arn:aws:route53:::hostedzone/${HostedZoneId}
+
+  SesS3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SesS3Lambda
+      Description: Resaves the s3 email object in a more readable format - mailbox/timestamp-subject
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Role: !GetAtt SesLambdaRole.Arn
+      Runtime: python3.6
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          def lambda_handler(event, context):
+              try:
+                  mail_bucket = '${BucketName}'
+                  ses = event['Records'][0]['ses']
+                  mail = ses['mail']
+                  mail_id = mail['messageId']
+                  s3 = boto3.client('s3')
+                  recipient = ses['receipt']['recipients'][0].split('@')[0]
+                  subject =  mail['commonHeaders']['subject']
+                  timestamp = mail['timestamp'][:-5]
+                  s3.copy_object(
+                      Bucket=mail_bucket,
+                      CopySource='{}/{}'.format(mail_bucket, mail_id),
+                      Key='{}/{} - {}'.format(recipient, timestamp, subject),
+                      StorageClass='STANDARD')
+                  s3.delete_object(
+                      Bucket=mail_bucket,
+                      Key=mail_id)
+              except Exception as e:
+                  print(event)
+                  raise e
+
+  BucketCleanupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BucketCleanupLambda
+      Description: Deletes all objects from a bucket before its deletion
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Role: !GetAtt SesLambdaRole.Arn
+      Runtime: python3.6
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import cfnresponse
+          def lambda_handler(event, context):
+              data = {}
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket)
+                      for obj in bucket.objects.filter():
+                          s3.Object(bucket.name, obj.key).delete()
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, data)
+                  raise e
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, data)
+          
+  CleanupBucketOnDelete:
+    Type: Custom::CleanupBucketOnDelete
+    Properties:
+      ServiceToken: !GetAtt BucketCleanupLambda.Arn
+      BucketName: !Ref EmailBucket
+
+  SesRuleSetLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SesRuleSetLambda
+      Description: Activates ses rule set after creation or disables it before deletion 
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Role: !GetAtt SesLambdaRole.Arn
+      Runtime: python3.6
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import cfnresponse
+          def lambda_handler(event, context):
+              data = {}
+              request_type = event['RequestType']
+              rule_set = event['ResourceProperties']['SesEmailRuleSet']
+              ses = boto3.client('ses')
+              try:
+                  if request_type == 'Create':
+                      ses.set_active_receipt_rule_set(RuleSetName=rule_set)
+                  elif request_type == 'Delete':
+                      ses.set_active_receipt_rule_set()
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, data)
+                  raise e
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, data)
+
+  VerifyDomainLambda:
+    Type: AWS::Lambda::Function
+    Condition: UseRoute53
+    Properties:
+      FunctionName: VerifyDomainLambda
+      Description: Veries domain in Ses and adds needed records to route53
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Role: !GetAtt SesLambdaRole.Arn
+      Runtime: python3.6
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import cfnresponse
+          def lambda_handler(event, context):
+              request_type = event['RequestType']
+              resource_properties = event['ResourceProperties']
+              hosted_zone_id = resource_properties['HostedZoneId']
+              mx_server = resource_properties['MxServer']
+              data = {}
+              try:
+                  if request_type == 'Create':
+                      verify_ses(hosted_zone_id, mx_server, 'UPSERT')
+                  elif request_type == 'Delete':
+                      verify_ses(hosted_zone_id, mx_server, 'DELETE')
+                  elif request_type == 'Update':
+                      old_hosted_zone_id = event['OldResourceProperties']['HostedZoneId']
+                      verify_ses(old_hosted_zone_id, mx_server, 'DELETE')
+                      verify_ses(hosted_zone_id, mx_server, 'UPSERT')
+              except Exception as e:
+                  # Do not fail on delete to avoid rollback failure
+                  status = cfnresponse.FAILED if request_type != 'Delete' else cfnresponse.SUCCESS
+                  cfnresponse.send(event, context, status, data)
+                  raise e
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, data)
+          def get_hosted_zone_name(hosted_zone_id):
+              route53 = boto3.client('route53')
+              route53_resp = route53.get_hosted_zone(Id=hosted_zone_id)
+              return route53_resp['HostedZone']['Name']
+          def verify_ses(hosted_zone_id, mx_server, action):
+              ses = boto3.client('ses')
+              hosted_zone_name = get_hosted_zone_name(hosted_zone_id=hosted_zone_id)
+              domain = hosted_zone_name.rstrip('.')
+              verification_token = ses.verify_domain_identity(Domain=domain)['VerificationToken']
+              changes = [
+                  {
+                      'Action': action,
+                      'ResourceRecordSet': {
+                          'Name': '_amazonses.{}'.format(hosted_zone_name),
+                          'Type': 'TXT',
+                          'TTL': 1800,
+                          'ResourceRecords': [
+                              {
+                                  'Value': '"{}"'.format(verification_token)
+                              }
+                          ]
+                      }
+                  },
+                  {
+                      'Action': action,
+                      'ResourceRecordSet': {
+                          'Name': '{}'.format(hosted_zone_name),
+                          'Type': 'MX',
+                          'TTL': 1800,
+                          'ResourceRecords': [
+                              {
+                                  'Value': '10 {}'.format(mx_server)
+                              }
+                          ]
+                      }
+                  }
+              ]
+              boto3.client('route53').change_resource_record_sets(
+              ChangeBatch={'Changes': changes},
+              HostedZoneId=hosted_zone_id)
+              if action == 'DELETE':
+                  ses.delete_identity(Identity=domain)
+              
+  AmazonSesVerificationRecords:
+    Type: Custom::AmazonSesVerificationRecords
+    Condition: UseRoute53
+    Properties:
+      ServiceToken: !GetAtt VerifyDomainLambda.Arn
+      HostedZoneId: !Ref HostedZoneId
+      MxServer: !FindInMap [SmtpServer, !Ref 'AWS::Region', smtp]
+
+  SesS3LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SesS3Lambda
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  SesReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: S3EmailRuleSet
+
+  ManageReceiptRuleSet:
+    Type: Custom::ManageReceiptRuleSet
+    Properties:
+      ServiceToken: !GetAtt SesRuleSetLambda.Arn
+      SesEmailRuleSet: !Ref SesReceiptRuleSet
+
+  SesReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: EmailBucketPolicy
+    Properties:
+      RuleSetName: !Ref SesReceiptRuleSet
+      Rule:
+        Enabled: True
+        ScanEnabled: True
+        Recipients: 
+          - !Ref Domain
+        Name: S3EmailRule
+        Actions:
+          - S3Action:
+              BucketName: !Ref EmailBucket
+          - LambdaAction:
+              FunctionArn: !GetAtt SesS3Lambda.Arn
+
+Outputs:
+  AccessKey:
+    Value: !Ref SesEmailUserKey
+  SecretKey:
+    Value: !GetAtt SesEmailUserKey.SecretAccessKey
