@@ -184,7 +184,7 @@ Resources:
                   mail_id = mail['messageId']
                   s3 = boto3.client('s3')
                   recipient = ses['receipt']['recipients'][0].split('@')[0]
-                  subject =  mail['commonHeaders']['subject']
+                  subject =  mail['commonHeaders']['subject'].replace('/','\\')
                   timestamp = mail['timestamp'][:-5]
                   s3.copy_object(
                       Bucket=mail_bucket,
